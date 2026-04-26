@@ -11,9 +11,13 @@ const MAX_CLIP_DURATION = 300; // seconds
 // ── helpers ────────────────────────────────────────────────────────────────────
 
 /**
- * Run yt-dlp to resolve the best progressive MP4 URL for a YouTube video ID.
+ * Run yt-dlp to resolve the best video (and audio) URL(s) for a YouTube video ID.
+ * When yt-dlp selects a format with separate video and audio streams it prints
+ * two URLs — one per line.  We return both so the caller can feed them to ffmpeg
+ * as separate inputs.
+ *
  * @param {string} videoId
- * @returns {Promise<string>} direct video URL
+ * @returns {Promise<{ videoUrl: string, audioUrl: string|null }>}
  */
 function resolveVideoUrl(videoId) {
   return new Promise((resolve, reject) => {
@@ -36,13 +40,15 @@ function resolveVideoUrl(videoId) {
       if (code !== 0) {
         return reject(new Error(`yt-dlp exited ${code}: ${stderr.trim()}`));
       }
-      // yt-dlp may return two lines when audio+video are separate streams;
-      // take only the first (video) URL.
-      const url = stdout.trim().split('\n')[0];
-      if (!url) {
+      // yt-dlp prints one URL per line; two lines means separate video+audio streams.
+      const urls = stdout.trim().split('\n').map((u) => u.trim()).filter(Boolean);
+      if (urls.length === 0) {
         return reject(new Error('yt-dlp returned empty URL'));
       }
-      resolve(url);
+      resolve({
+        videoUrl: urls[0],
+        audioUrl: urls.length > 1 ? urls[1] : null,
+      });
     });
   });
 }
@@ -114,9 +120,9 @@ async function handleRequest(req, res) {
     const duration  = Math.min(requested, MAX_CLIP_DURATION);
     const capped    = duration < requested;
 
-    let directUrl;
+    let videoUrl, audioUrl;
     try {
-      directUrl = await resolveVideoUrl(videoId);
+      ({ videoUrl, audioUrl } = await resolveVideoUrl(videoId));
     } catch (err) {
       console.error('[clip] yt-dlp error:', err.message);
       res.writeHead(502, { 'Content-Type': 'application/json' });
@@ -124,11 +130,17 @@ async function handleRequest(req, res) {
       return;
     }
 
-    // Place -ss BEFORE -i so ffmpeg performs a fast keyframe seek, then
+    // Place -ss BEFORE each -i so ffmpeg performs a fast keyframe seek, then
     // re-encode from that point to guarantee a clean start on Safari.
+    // When yt-dlp returns separate video and audio streams we feed them as two
+    // inputs and use explicit -map flags so ffmpeg encodes both streams.
     const ffmpegArgs = [
       '-ss', String(start),
-      '-i', directUrl,
+      '-i', videoUrl,
+      // When yt-dlp provides a separate audio stream, add it as a second input
+      // and map both tracks explicitly; otherwise ffmpeg auto-selects from the
+      // single combined input.
+      ...(audioUrl ? ['-ss', String(start), '-i', audioUrl, '-map', '0:v:0', '-map', '1:a:0'] : []),
       '-t', String(duration),
       '-c:v', 'libx264',
       '-preset', 'veryfast',
