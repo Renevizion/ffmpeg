@@ -49,6 +49,7 @@ function resolveVideoUrl(videoId, url) {
     const sourceUrl = url || `https://www.youtube.com/watch?v=${videoId}`;
 
     const isYouTube = sourceUrl.includes('youtube.com') || sourceUrl.includes('youtu.be');
+    const isKick    = sourceUrl.includes('kick.com');
 
     const cookiePath = writeCookieFile();
 
@@ -62,6 +63,11 @@ function resolveVideoUrl(videoId, url) {
     // current player without needing a browser extension.
     if (isYouTube) {
       args.push('--extractor-args', 'youtube:player_client=web,default');
+    }
+
+    // Impersonate Chrome to bypass Cloudflare TLS fingerprinting on Kick.
+    if (isKick) {
+      args.push('--impersonate', 'chrome');
     }
 
     // Inject cookies when available (helps avoid YouTube 429 rate limits).
