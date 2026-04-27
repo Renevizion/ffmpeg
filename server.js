@@ -9,7 +9,7 @@ import { deflateRawSync, crc32 } from 'zlib';
 const PORT = process.env.PORT || 3000;
 const WORKER_TOKEN = process.env.WORKER_TOKEN || '';
 const MAX_CLIP_DURATION = 300; // seconds
-const VERSION = '2026-04-27-dynamic-impersonate-target';
+const VERSION = '2026-04-27-youtube-cookie-free';
 
 // ── helpers ────────────────────────────────────────────────────────────────────
 
@@ -92,19 +92,39 @@ function writeCookieFile() {
   return cookiePath;
 }
 
+/**
+ * Write Kick cookies to a temp file if the KICK_COOKIES or
+ * KICK_COOKIES_B64 environment variable is set, and return the file path.
+ * Returns null when no cookie data is configured.
+ *
+ * @returns {string|null}
+ */
+function writeKickCookieFile() {
+  const raw = process.env.KICK_COOKIES || '';
+  const b64 = process.env.KICK_COOKIES_B64 || '';
+  const content = raw || (b64 ? Buffer.from(b64, 'base64').toString('utf8') : '');
+  if (!content) return null;
+
+  const cookiePath = path.join(os.tmpdir(), 'kick-cookies.txt');
+  fs.writeFileSync(cookiePath, content, { mode: 0o600 });
+  return cookiePath;
+}
+
 // ── startup: detect available impersonate targets ──────────────────────────────
 // Populated once at startup; used by resolveVideoUrl and /healthz.
+// Default to 'chrome' so Kick requests are impersonated even if the startup
+// detection hasn't completed yet or the yt-dlp version predates
+// --list-impersonate-targets.  curl_cffi is installed in the Dockerfile so
+// the generic 'chrome' target is always available.
 let chromeImpersonateTargets = [];
-let kickImpersonateTarget = null;
+let kickImpersonateTarget = 'chrome';
 
 availableImpersonateTargets().then((targets) => {
   chromeImpersonateTargets = targets.filter((t) => /^chrome(-\d+)?$/.test(t));
-  kickImpersonateTarget = bestChromeImpersonateTarget(targets);
-  if (kickImpersonateTarget) {
-    console.log(`[startup] Kick impersonate target: ${kickImpersonateTarget} (available Chrome targets: ${chromeImpersonateTargets.join(', ')})`);
-  } else {
-    console.warn('[startup] No Chrome impersonate targets found — Kick requests will proceed without --impersonate');
-  }
+  // Use the highest-versioned Chrome target detected; fall back to the generic
+  // 'chrome' target which curl_cffi always provides when installed.
+  kickImpersonateTarget = bestChromeImpersonateTarget(targets) || 'chrome';
+  console.log(`[startup] Kick impersonate target: ${kickImpersonateTarget} (detected Chrome targets: ${chromeImpersonateTargets.join(', ') || 'none — using generic chrome'})`);
 });
 
 /**
@@ -134,28 +154,34 @@ async function resolveVideoUrl(videoId, url) {
     '--get-url',
   ];
 
-  // Enable the native JS player runtime so yt-dlp can handle YouTube's
-  // current player without needing a browser extension.
+  // YouTube: use the web JS player + all cookie-free client fallbacks, and
+  // impersonate Chrome to pass Google's TLS fingerprint checks — no cookies
+  // needed for public videos.
   if (isYouTube) {
-    args.push('--extractor-args', 'youtube:player_client=web,default');
+    args.push('--extractor-args', 'youtube:player_client=web,mweb,tv_embedded,default');
+    args.push('--impersonate', kickImpersonateTarget);
   }
 
   // Impersonate Chrome to bypass Cloudflare TLS fingerprinting on Kick.
-  // curl_cffi (installed via yt-dlp[default,curl-cffi]) provides the
-  // TLS impersonation support that makes this work.  We only add the flag
-  // when a real target was detected at startup — using a target that does not
-  // exist in the installed yt-dlp causes a hard failure (HTTP 403 / exit 1).
+  // curl_cffi (installed via yt-dlp[default,curl-cffi]) provides the TLS
+  // impersonation support.  kickImpersonateTarget is always set to at least
+  // 'chrome' (the generic target) so this branch always fires for Kick.
   if (isKick) {
-    if (kickImpersonateTarget) {
-      console.log(`[yt-dlp] Kick URL detected — using --impersonate ${kickImpersonateTarget}`);
-      args.push('--impersonate', kickImpersonateTarget);
-    } else {
-      console.warn('[yt-dlp] Kick URL detected — no Chrome impersonate target available, proceeding without --impersonate');
+    console.log(`[yt-dlp] Kick URL detected — using --impersonate ${kickImpersonateTarget}`);
+    args.push('--impersonate', kickImpersonateTarget);
+    // Pass Referer so Kick's API/CDN does not block the metadata request.
+    args.push('--add-headers', 'Referer:https://kick.com');
+    // Inject Kick session cookies when configured (optional — public VODs do
+    // not require them; set KICK_COOKIES / KICK_COOKIES_B64 only if needed).
+    const kickCookiePath = writeKickCookieFile();
+    if (kickCookiePath) {
+      console.log('[yt-dlp] Kick cookies configured — injecting cookie file');
+      args.push('--cookies', kickCookiePath);
     }
   }
 
   // Inject cookies when available (helps avoid YouTube 429 rate limits).
-  if (cookiePath) {
+  if (!isKick && cookiePath) {
     args.push('--cookies', cookiePath);
   }
 
@@ -394,12 +420,16 @@ async function handleRequest(req, res) {
     const youtubeCookiesConfigured = !!(
       process.env.YOUTUBE_COOKIES || process.env.YOUTUBE_COOKIES_B64
     );
+    const kickCookiesConfigured = !!(
+      process.env.KICK_COOKIES || process.env.KICK_COOKIES_B64
+    );
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({
       ok: true,
       version: VERSION,
       ytDlpVersion: ytdlpVersionResult.stdout.trim(),
       youtubeCookiesConfigured,
+      kickCookiesConfigured,
       kickImpersonateTarget,
       chromeImpersonateTargets,
       multiFormatSupport: true,
