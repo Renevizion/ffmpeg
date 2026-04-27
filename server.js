@@ -9,7 +9,7 @@ import { deflateRawSync, crc32 } from 'zlib';
 const PORT = process.env.PORT || 3000;
 const WORKER_TOKEN = process.env.WORKER_TOKEN || '';
 const MAX_CLIP_DURATION = 300; // seconds
-const VERSION = '2026-04-27-youtube-cookie-free';
+const VERSION = '2026-04-27-kick-session-token';
 
 // ── helpers ────────────────────────────────────────────────────────────────────
 
@@ -110,6 +110,30 @@ function writeKickCookieFile() {
   return cookiePath;
 }
 
+/**
+ * Write a minimal Netscape cookie file containing just the Kick session_token
+ * when the KICK_SESSION_TOKEN environment variable is set.  yt-dlp's Kick
+ * extractor reads this cookie to build the required "Authorization: Bearer
+ * <token>" header for its metadata API calls (without it Kick returns HTTP 403).
+ * Returns the file path on success, or null when the variable is not set.
+ *
+ * @returns {string|null}
+ */
+function writeKickSessionTokenCookieFile() {
+  const token = process.env.KICK_SESSION_TOKEN || '';
+  if (!token) return null;
+
+  // Netscape cookie format: domain, include-subdomains, path, secure, expiry, name, value
+  const content = [
+    '# Netscape HTTP Cookie File',
+    `kick.com\tFALSE\t/\tTRUE\t0\tsession_token\t${token}`,
+  ].join('\n') + '\n';
+
+  const cookiePath = path.join(os.tmpdir(), 'kick-session-cookies.txt');
+  fs.writeFileSync(cookiePath, content, { mode: 0o600 });
+  return cookiePath;
+}
+
 // ── startup: detect available impersonate targets ──────────────────────────────
 // Populated once at startup; used by resolveVideoUrl and /healthz.
 // Default to 'chrome' so Kick requests are impersonated even if the startup
@@ -169,14 +193,26 @@ async function resolveVideoUrl(videoId, url) {
   if (isKick) {
     console.log(`[yt-dlp] Kick URL detected — using --impersonate ${kickImpersonateTarget}`);
     args.push('--impersonate', kickImpersonateTarget);
-    // Pass Referer so Kick's API/CDN does not block the metadata request.
+    // Pass Referer and Origin so Kick's API/CDN does not block the metadata
+    // request due to missing browser navigation context headers.
     args.push('--add-headers', 'Referer:https://kick.com');
-    // Inject Kick session cookies when configured (optional — public VODs do
-    // not require them; set KICK_COOKIES / KICK_COOKIES_B64 only if needed).
-    const kickCookiePath = writeKickCookieFile();
-    if (kickCookiePath) {
-      console.log('[yt-dlp] Kick cookies configured — injecting cookie file');
-      args.push('--cookies', kickCookiePath);
+    args.push('--add-headers', 'Origin:https://kick.com');
+    // Kick's metadata API now requires an "Authorization: Bearer <session_token>"
+    // header (HTTP 403 without it).  yt-dlp's Kick extractor builds this header
+    // automatically from the "session_token" cookie.  We support two ways to
+    // provide that cookie:
+    //   1. KICK_SESSION_TOKEN — just the raw token value (simplest to configure)
+    //   2. KICK_COOKIES / KICK_COOKIES_B64 — a full Netscape cookie file
+    // The session-token cookie file takes priority; if only the full cookie file
+    // is provided it is used as-is (it may already include session_token).
+    const kickSessionCookiePath = writeKickSessionTokenCookieFile();
+    const kickCookiePath        = kickSessionCookiePath ? null : writeKickCookieFile();
+    const activeCookiePath      = kickSessionCookiePath || kickCookiePath;
+    if (activeCookiePath) {
+      console.log(`[yt-dlp] Kick cookies configured — injecting cookie file (${kickSessionCookiePath ? 'session token' : 'full cookie file'})`);
+      args.push('--cookies', activeCookiePath);
+    } else {
+      console.log('[yt-dlp] No Kick session token configured — set KICK_SESSION_TOKEN for Kick VOD access');
     }
   }
 
@@ -423,6 +459,7 @@ async function handleRequest(req, res) {
     const kickCookiesConfigured = !!(
       process.env.KICK_COOKIES || process.env.KICK_COOKIES_B64
     );
+    const kickSessionTokenConfigured = !!process.env.KICK_SESSION_TOKEN;
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({
       ok: true,
@@ -430,6 +467,7 @@ async function handleRequest(req, res) {
       ytDlpVersion: ytdlpVersionResult.stdout.trim(),
       youtubeCookiesConfigured,
       kickCookiesConfigured,
+      kickSessionTokenConfigured,
       kickImpersonateTarget,
       chromeImpersonateTargets,
       multiFormatSupport: true,
