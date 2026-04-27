@@ -8,7 +8,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         python3-pip \
         curl \
         ca-certificates \
-    && pip3 install --no-cache-dir --break-system-packages "yt-dlp[default,curl-cffi]" \
+    && pip3 install --no-cache-dir --break-system-packages --upgrade "yt-dlp[default,curl-cffi]" \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 

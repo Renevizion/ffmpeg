@@ -9,7 +9,7 @@ import { deflateRawSync, crc32 } from 'zlib';
 const PORT = process.env.PORT || 3000;
 const WORKER_TOKEN = process.env.WORKER_TOKEN || '';
 const MAX_CLIP_DURATION = 300; // seconds
-const VERSION = '2026-04-27-dynamic-impersonate-target';
+const VERSION = '2026-04-27-kick-cookies-referer';
 
 // ── helpers ────────────────────────────────────────────────────────────────────
 
@@ -92,6 +92,24 @@ function writeCookieFile() {
   return cookiePath;
 }
 
+/**
+ * Write Kick cookies to a temp file if the KICK_COOKIES or
+ * KICK_COOKIES_B64 environment variable is set, and return the file path.
+ * Returns null when no cookie data is configured.
+ *
+ * @returns {string|null}
+ */
+function writeKickCookieFile() {
+  const raw = process.env.KICK_COOKIES || '';
+  const b64 = process.env.KICK_COOKIES_B64 || '';
+  const content = raw || (b64 ? Buffer.from(b64, 'base64').toString('utf8') : '');
+  if (!content) return null;
+
+  const cookiePath = path.join(os.tmpdir(), 'kick-cookies.txt');
+  fs.writeFileSync(cookiePath, content, { mode: 0o600 });
+  return cookiePath;
+}
+
 // ── startup: detect available impersonate targets ──────────────────────────────
 // Populated once at startup; used by resolveVideoUrl and /healthz.
 let chromeImpersonateTargets = [];
@@ -152,10 +170,21 @@ async function resolveVideoUrl(videoId, url) {
     } else {
       console.warn('[yt-dlp] Kick URL detected — no Chrome impersonate target available, proceeding without --impersonate');
     }
+    // Pass Referer so Kick's API/CDN does not block the metadata request.
+    args.push('--add-headers', 'Referer:https://kick.com');
+    // Inject Kick session cookies when configured (required since Kick began
+    // gating VOD metadata behind authentication).
+    const kickCookiePath = writeKickCookieFile();
+    if (kickCookiePath) {
+      console.log('[yt-dlp] Kick cookies configured — injecting cookie file');
+      args.push('--cookies', kickCookiePath);
+    } else {
+      console.warn('[yt-dlp] Kick cookies not configured — set KICK_COOKIES or KICK_COOKIES_B64 if VODs return 403');
+    }
   }
 
   // Inject cookies when available (helps avoid YouTube 429 rate limits).
-  if (cookiePath) {
+  if (!isKick && cookiePath) {
     args.push('--cookies', cookiePath);
   }
 
@@ -394,12 +423,16 @@ async function handleRequest(req, res) {
     const youtubeCookiesConfigured = !!(
       process.env.YOUTUBE_COOKIES || process.env.YOUTUBE_COOKIES_B64
     );
+    const kickCookiesConfigured = !!(
+      process.env.KICK_COOKIES || process.env.KICK_COOKIES_B64
+    );
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({
       ok: true,
       version: VERSION,
       ytDlpVersion: ytdlpVersionResult.stdout.trim(),
       youtubeCookiesConfigured,
+      kickCookiesConfigured,
       kickImpersonateTarget,
       chromeImpersonateTargets,
       multiFormatSupport: true,
