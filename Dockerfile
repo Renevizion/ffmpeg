@@ -1,5 +1,5 @@
 # syntax=docker/dockerfile:1
-FROM debian:bookworm-slim
+FROM node:20-slim
 
 # Install system dependencies: ffmpeg, Python + pip (for yt-dlp), curl (healthcheck)
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -8,13 +8,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         python3-pip \
         curl \
         ca-certificates \
-    && pip3 install --no-cache-dir --break-system-packages yt-dlp curl_cffi certifi \
-    && apt-get clean \
-    && rm -rf /var/lib/apt/lists/*
-
-# Install Node.js 20 LTS
-RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
-    && apt-get install -y --no-install-recommends nodejs \
+    && pip3 install --no-cache-dir --break-system-packages "yt-dlp[default,curl-cffi]" \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 

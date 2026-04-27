@@ -1,16 +1,14 @@
-'use strict';
-
-const http = require('http');
-const fs = require('fs');
-const os = require('os');
-const path = require('path');
-const { spawn } = require('child_process');
-const { URL } = require('url');
+import http from 'http';
+import fs from 'fs';
+import os from 'os';
+import path from 'path';
+import { spawn } from 'child_process';
+import { URL } from 'url';
 
 const PORT = process.env.PORT || 3000;
 const WORKER_TOKEN = process.env.WORKER_TOKEN || '';
 const MAX_CLIP_DURATION = 300; // seconds
-const VERSION = '2026-04-27-ytdlp-impersonate-detection';
+const VERSION = '2026-04-27-ytdlp-post-cookies';
 
 // ── helpers ────────────────────────────────────────────────────────────────────
 
@@ -32,48 +30,6 @@ function parseCommandOutput(cmd, args) {
     proc.on('error', reject);
     proc.on('close', (code) => resolve({ stdout, stderr, code }));
   });
-}
-
-// Cache for impersonate target detection — queried once per process lifetime.
-/** @type {{ targets: string[], best: string|null }|null} */
-let _impersonateCache = null;
-
-/**
- * Query `yt-dlp --list-impersonate-targets`, parse the output for Chrome
- * targets (e.g. `chrome-120`, `chrome-121`), and return the highest numeric
- * version found plus the full list.  The result is cached so yt-dlp is only
- * invoked once per process lifetime.
- *
- * @returns {Promise<{ targets: string[], best: string|null }>}
- */
-async function getAvailableImpersonateTargets() {
-  if (_impersonateCache !== null) return _impersonateCache;
-
-  try {
-    const { stdout } = await parseCommandOutput('yt-dlp', ['--list-impersonate-targets']);
-
-    // Each line looks like:  chrome-120   Windows 10   ...
-    // We want tokens that match the pattern chrome-<digits>.
-    const chromeTargets = [];
-    for (const line of stdout.split('\n')) {
-      const match = line.match(/\b(chrome-(\d+))\b/i);
-      if (match) {
-        chromeTargets.push({ target: match[1].toLowerCase(), version: parseInt(match[2], 10) });
-      }
-    }
-
-    // Sort descending by version number and pick the highest.
-    chromeTargets.sort((a, b) => b.version - a.version);
-    const targets = chromeTargets.map((t) => t.target);
-    const best    = targets.length > 0 ? targets[0] : null;
-
-    _impersonateCache = { targets, best };
-  } catch (err) {
-    console.warn('[impersonate] could not query yt-dlp targets:', err.message);
-    _impersonateCache = { targets: [], best: null };
-  }
-
-  return _impersonateCache;
 }
 
 /**
@@ -111,6 +67,7 @@ async function resolveVideoUrl(videoId, url) {
 
   const isYouTube = sourceUrl.includes('youtube.com') || sourceUrl.includes('youtu.be');
   const isKick    = sourceUrl.includes('kick.com');
+  const isTwitch  = sourceUrl.includes('twitch.tv');
 
   const cookiePath = writeCookieFile();
 
@@ -126,17 +83,12 @@ async function resolveVideoUrl(videoId, url) {
     args.push('--extractor-args', 'youtube:player_client=web,default');
   }
 
-  // Impersonate a real Chrome target to bypass Cloudflare TLS fingerprinting
-  // on Kick.  We detect which targets are actually available first so we never
-  // request a generic/unavailable target that would cause yt-dlp to error out.
+  // Impersonate Chrome to bypass Cloudflare TLS fingerprinting on Kick.
+  // curl_cffi (installed via yt-dlp[default,curl-cffi]) provides the
+  // TLS impersonation support that makes this work.
   if (isKick) {
-    const { best } = await getAvailableImpersonateTargets();
-    if (best) {
-      console.log(`[yt-dlp] using impersonate target: ${best}`);
-      args.push('--impersonate', best);
-    } else {
-      console.warn('[yt-dlp] no Chrome impersonate targets available — skipping --impersonate');
-    }
+    console.log('[yt-dlp] Kick URL detected — using --impersonate chrome');
+    args.push('--impersonate', 'chrome');
   }
 
   // Inject cookies when available (helps avoid YouTube 429 rate limits).
@@ -145,6 +97,9 @@ async function resolveVideoUrl(videoId, url) {
   }
 
   args.push(sourceUrl);
+
+  console.log(`[yt-dlp] resolving URL: ${sourceUrl}`);
+  if (isTwitch) console.log('[yt-dlp] Twitch URL detected');
 
   return new Promise((resolve, reject) => {
     const ytdlp = spawn('yt-dlp', args);
@@ -198,16 +153,16 @@ async function handleRequest(req, res) {
 
   // ── GET /healthz ─────────────────────────────────────────────────────────────
   if (parsed.pathname === '/healthz') {
-    const [impersonate, ytdlpVersionResult] = await Promise.all([
-      getAvailableImpersonateTargets(),
-      parseCommandOutput('yt-dlp', ['--version']),
-    ]);
+    const ytdlpVersionResult = await parseCommandOutput('yt-dlp', ['--version']);
+    const youtubeCookiesConfigured = !!(
+      process.env.YOUTUBE_COOKIES || process.env.YOUTUBE_COOKIES_B64
+    );
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({
       ok: true,
       version: VERSION,
       ytDlpVersion: ytdlpVersionResult.stdout.trim(),
-      availableImpersonateTargets: impersonate.targets,
+      youtubeCookiesConfigured,
     }));
     return;
   }
