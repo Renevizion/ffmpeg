@@ -9,7 +9,7 @@ import { deflateRawSync, crc32 } from 'zlib';
 const PORT = process.env.PORT || 3000;
 const WORKER_TOKEN = process.env.WORKER_TOKEN || '';
 const MAX_CLIP_DURATION = 300; // seconds
-const VERSION = '2026-04-27-ytdlp-post-cookies-multi-format';
+const VERSION = '2026-04-27-dynamic-impersonate-target';
 
 // ── helpers ────────────────────────────────────────────────────────────────────
 
@@ -34,6 +34,47 @@ function parseCommandOutput(cmd, args) {
 }
 
 /**
+ * Query yt-dlp for all available impersonate targets and return them as an
+ * array of lowercase strings (e.g. ['chrome-120', 'chrome-121', 'safari-17']).
+ * Returns an empty array if the flag is unsupported or yt-dlp is unavailable.
+ *
+ * @returns {Promise<string[]>}
+ */
+async function availableImpersonateTargets() {
+  try {
+    const { stdout, code } = await parseCommandOutput('yt-dlp', ['--list-impersonate-targets']);
+    if (code !== 0) return [];
+    // Each line looks like:  "chrome-120   Chrome 120   ..."
+    // We grab the first whitespace-delimited token on each non-header line.
+    return stdout
+      .split('\n')
+      .map((l) => l.trim().split(/\s+/)[0].toLowerCase())
+      .filter((t) => t && t !== 'target' && !t.startsWith('-'));
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Given a list of impersonate targets, return the highest-versioned Chrome
+ * target (e.g. 'chrome-121' beats 'chrome-120'), or null if none exist.
+ *
+ * @param {string[]} targets
+ * @returns {string|null}
+ */
+function bestChromeImpersonateTarget(targets) {
+  const chromeTargets = targets.filter((t) => /^chrome(-\d+)?$/.test(t));
+  if (chromeTargets.length === 0) return null;
+  // Sort by version number descending; bare 'chrome' sorts as version 0.
+  chromeTargets.sort((a, b) => {
+    const verA = parseInt(a.split('-')[1] || '0', 10);
+    const verB = parseInt(b.split('-')[1] || '0', 10);
+    return verB - verA;
+  });
+  return chromeTargets[0];
+}
+
+/**
  * Write YouTube cookies to a temp file if the YOUTUBE_COOKIES or
  * YOUTUBE_COOKIES_B64 environment variable is set, and return the file path.
  * Returns null when no cookie data is configured.
@@ -50,6 +91,21 @@ function writeCookieFile() {
   fs.writeFileSync(cookiePath, content, { mode: 0o600 });
   return cookiePath;
 }
+
+// ── startup: detect available impersonate targets ──────────────────────────────
+// Populated once at startup; used by resolveVideoUrl and /healthz.
+let chromeImpersonateTargets = [];
+let kickImpersonateTarget = null;
+
+availableImpersonateTargets().then((targets) => {
+  chromeImpersonateTargets = targets.filter((t) => /^chrome(-\d+)?$/.test(t));
+  kickImpersonateTarget = bestChromeImpersonateTarget(targets);
+  if (kickImpersonateTarget) {
+    console.log(`[startup] Kick impersonate target: ${kickImpersonateTarget} (available Chrome targets: ${chromeImpersonateTargets.join(', ')})`);
+  } else {
+    console.warn('[startup] No Chrome impersonate targets found — Kick requests will proceed without --impersonate');
+  }
+});
 
 /**
  * Run yt-dlp to resolve the best video (and audio) URL(s) for a given source.
@@ -86,10 +142,16 @@ async function resolveVideoUrl(videoId, url) {
 
   // Impersonate Chrome to bypass Cloudflare TLS fingerprinting on Kick.
   // curl_cffi (installed via yt-dlp[default,curl-cffi]) provides the
-  // TLS impersonation support that makes this work.
+  // TLS impersonation support that makes this work.  We only add the flag
+  // when a real target was detected at startup — using a target that does not
+  // exist in the installed yt-dlp causes a hard failure (HTTP 403 / exit 1).
   if (isKick) {
-    console.log('[yt-dlp] Kick URL detected — using --impersonate chrome');
-    args.push('--impersonate', 'chrome');
+    if (kickImpersonateTarget) {
+      console.log(`[yt-dlp] Kick URL detected — using --impersonate ${kickImpersonateTarget}`);
+      args.push('--impersonate', kickImpersonateTarget);
+    } else {
+      console.warn('[yt-dlp] Kick URL detected — no Chrome impersonate target available, proceeding without --impersonate');
+    }
   }
 
   // Inject cookies when available (helps avoid YouTube 429 rate limits).
@@ -338,6 +400,8 @@ async function handleRequest(req, res) {
       version: VERSION,
       ytDlpVersion: ytdlpVersionResult.stdout.trim(),
       youtubeCookiesConfigured,
+      kickImpersonateTarget,
+      chromeImpersonateTargets,
       multiFormatSupport: true,
       supportedAspectRatios: ['16:9', '9:16', '1:1'],
     }));
@@ -358,6 +422,7 @@ async function handleRequest(req, res) {
     const startRaw = parsed.searchParams.get('start');
     const endRaw   = parsed.searchParams.get('end');
     const title    = parsed.searchParams.get('title') || 'clip';
+    const format   = parsed.searchParams.get('format'); // horizontal | vertical | square
 
     if (!videoId && !clipUrl) {
       res.writeHead(400, { 'Content-Type': 'application/json' });
@@ -369,6 +434,15 @@ async function handleRequest(req, res) {
       res.end(JSON.stringify({ error: 'Missing required parameters: start, end' }));
       return;
     }
+
+    // Map friendly format names to aspect ratios used by encodeClipWithAspectRatio.
+    const FORMAT_TO_RATIO = { horizontal: '16:9', vertical: '9:16', square: '1:1' };
+    if (format && !FORMAT_TO_RATIO[format]) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: `Invalid format: "${format}". Supported values: horizontal, vertical, square` }));
+      return;
+    }
+    const aspectRatio = format ? FORMAT_TO_RATIO[format] : null;
 
     const start = parseFloat(startRaw);
     const end   = parseFloat(endRaw);
@@ -393,6 +467,36 @@ async function handleRequest(req, res) {
       return;
     }
 
+    // When a format/aspect-ratio is requested, use the reframing encoder which
+    // scales + pads the video to the target canvas.  The result is buffered in
+    // memory before being sent so we can set Content-Length.
+    if (aspectRatio) {
+      let clipBuffer;
+      try {
+        clipBuffer = await encodeClipWithAspectRatio(videoUrl, audioUrl, start, duration, aspectRatio, title);
+      } catch (err) {
+        console.error('[clip] ffmpeg error:', err.message);
+        res.writeHead(500, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'ffmpeg encoding failed', detail: err.message }));
+        return;
+      }
+
+      const filename = `${safeFilename(title)}_${format}.mp4`;
+      const headers = {
+        'Content-Type': 'video/mp4',
+        'Content-Disposition': `attachment; filename="${filename}"`,
+        'Content-Length': String(clipBuffer.length),
+        'Cache-Control': 'no-store',
+        'X-Clip-Duration': String(duration),
+        'X-Clip-Format': format,
+      };
+      if (capped) headers['X-Clip-Capped'] = `true; max=${MAX_CLIP_DURATION}s`;
+      res.writeHead(200, headers);
+      res.end(clipBuffer);
+      return;
+    }
+
+    // No format requested — stream the clip directly from ffmpeg (original behaviour).
     // Place -ss BEFORE each -i so ffmpeg performs a fast keyframe seek, then
     // re-encode from that point to guarantee a clean start on Safari.
     // When yt-dlp returns separate video and audio streams we feed them as two
@@ -460,7 +564,6 @@ async function handleRequest(req, res) {
     return;
   }
 
-  // ── GET /clips ────────────────────────────────────────────────────────────────
   // Same params as /clip but generates all three aspect ratios in parallel and
   // returns a ZIP archive containing clip_16x9.mp4, clip_9x16.mp4, clip_1x1.mp4.
   if (parsed.pathname === '/clips') {
