@@ -1,32 +1,77 @@
 'use strict';
 
 const http = require('http');
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
 const { spawn } = require('child_process');
 const { URL } = require('url');
 
 const PORT = process.env.PORT || 3000;
 const WORKER_TOKEN = process.env.WORKER_TOKEN || '';
 const MAX_CLIP_DURATION = 300; // seconds
+const VERSION = '2026-04-27-ytdlp-post-cookies';
 
 // ── helpers ────────────────────────────────────────────────────────────────────
 
 /**
- * Run yt-dlp to resolve the best video (and audio) URL(s) for a YouTube video ID.
- * When yt-dlp selects a format with separate video and audio streams it prints
- * two URLs — one per line.  We return both so the caller can feed them to ffmpeg
- * as separate inputs.
+ * Write YouTube cookies to a temp file if the YOUTUBE_COOKIES or
+ * YOUTUBE_COOKIES_B64 environment variable is set, and return the file path.
+ * Returns null when no cookie data is configured.
  *
- * @param {string} videoId
+ * @returns {string|null}
+ */
+function writeCookieFile() {
+  const raw = process.env.YOUTUBE_COOKIES || '';
+  const b64 = process.env.YOUTUBE_COOKIES_B64 || '';
+  const content = raw || (b64 ? Buffer.from(b64, 'base64').toString('utf8') : '');
+  if (!content) return null;
+
+  const cookiePath = path.join(os.tmpdir(), 'yt-cookies.txt');
+  fs.writeFileSync(cookiePath, content, { mode: 0o600 });
+  return cookiePath;
+}
+
+/**
+ * Run yt-dlp to resolve the best video (and audio) URL(s) for a given source.
+ * Accepts either a full URL (Kick, Twitch, YouTube, etc.) or a bare YouTube
+ * video ID.  When yt-dlp selects a format with separate video and audio streams
+ * it prints two URLs — one per line.  We return both so the caller can feed
+ * them to ffmpeg as separate inputs.
+ *
+ * @param {string} videoId  - YouTube video ID (legacy)
+ * @param {string|null} url - Full source URL (Kick/Twitch/YouTube/…)
  * @returns {Promise<{ videoUrl: string, audioUrl: string|null }>}
  */
-function resolveVideoUrl(videoId) {
+function resolveVideoUrl(videoId, url) {
   return new Promise((resolve, reject) => {
-    const ytdlp = spawn('yt-dlp', [
+    // Prefer an explicit URL; fall back to constructing a YouTube watch URL.
+    const sourceUrl = url || `https://www.youtube.com/watch?v=${videoId}`;
+
+    const isYouTube = sourceUrl.includes('youtube.com') || sourceUrl.includes('youtu.be');
+
+    const cookiePath = writeCookieFile();
+
+    const args = [
       '--no-playlist',
       '-f', 'bestvideo[ext=mp4][vcodec^=avc]+bestaudio[ext=m4a]/best[ext=mp4][vcodec^=avc]/best[ext=mp4]/best',
       '--get-url',
-      `https://www.youtube.com/watch?v=${videoId}`,
-    ]);
+    ];
+
+    // Enable the native JS player runtime so yt-dlp can handle YouTube's
+    // current player without needing a browser extension.
+    if (isYouTube) {
+      args.push('--extractor-args', 'youtube:player_client=web,default');
+    }
+
+    // Inject cookies when available (helps avoid YouTube 429 rate limits).
+    if (cookiePath) {
+      args.push('--cookies', cookiePath);
+    }
+
+    args.push(sourceUrl);
+
+    const ytdlp = spawn('yt-dlp', args);
 
     let stdout = '';
     let stderr = '';
@@ -78,7 +123,7 @@ async function handleRequest(req, res) {
   // ── GET /healthz ─────────────────────────────────────────────────────────────
   if (parsed.pathname === '/healthz') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ ok: true }));
+    res.end(JSON.stringify({ ok: true, version: VERSION }));
     return;
   }
 
@@ -92,13 +137,14 @@ async function handleRequest(req, res) {
     }
 
     const videoId  = parsed.searchParams.get('videoId');
+    const clipUrl  = parsed.searchParams.get('url');
     const startRaw = parsed.searchParams.get('start');
     const endRaw   = parsed.searchParams.get('end');
     const title    = parsed.searchParams.get('title') || 'clip';
 
-    if (!videoId) {
+    if (!videoId && !clipUrl) {
       res.writeHead(400, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ error: 'Missing required parameter: videoId' }));
+      res.end(JSON.stringify({ error: 'Missing required parameter: videoId or url' }));
       return;
     }
     if (startRaw === null || endRaw === null) {
@@ -122,7 +168,7 @@ async function handleRequest(req, res) {
 
     let videoUrl, audioUrl;
     try {
-      ({ videoUrl, audioUrl } = await resolveVideoUrl(videoId));
+      ({ videoUrl, audioUrl } = await resolveVideoUrl(videoId, clipUrl));
     } catch (err) {
       console.error('[clip] yt-dlp error:', err.message);
       res.writeHead(502, { 'Content-Type': 'application/json' });
