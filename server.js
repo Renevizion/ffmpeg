@@ -9,7 +9,7 @@ import { deflateRawSync, crc32 } from 'zlib';
 const PORT = process.env.PORT || 3000;
 const WORKER_TOKEN = process.env.WORKER_TOKEN || '';
 const MAX_CLIP_DURATION = 300; // seconds
-const VERSION = '2026-04-27-kick-impersonate-fallback';
+const VERSION = '2026-04-27-youtube-cookie-free';
 
 // ── helpers ────────────────────────────────────────────────────────────────────
 
@@ -154,10 +154,12 @@ async function resolveVideoUrl(videoId, url) {
     '--get-url',
   ];
 
-  // Enable the native JS player runtime so yt-dlp can handle YouTube's
-  // current player without needing a browser extension.
+  // YouTube: use the web JS player + all cookie-free client fallbacks, and
+  // impersonate Chrome to pass Google's TLS fingerprint checks — no cookies
+  // needed for public videos.
   if (isYouTube) {
-    args.push('--extractor-args', 'youtube:player_client=web,default');
+    args.push('--extractor-args', 'youtube:player_client=web,mweb,tv_embedded,default');
+    args.push('--impersonate', kickImpersonateTarget);
   }
 
   // Impersonate Chrome to bypass Cloudflare TLS fingerprinting on Kick.
