@@ -4,11 +4,12 @@ import os from 'os';
 import path from 'path';
 import { spawn } from 'child_process';
 import { URL } from 'url';
+import { deflateRawSync, crc32 } from 'zlib';
 
 const PORT = process.env.PORT || 3000;
 const WORKER_TOKEN = process.env.WORKER_TOKEN || '';
 const MAX_CLIP_DURATION = 300; // seconds
-const VERSION = '2026-04-27-ytdlp-post-cookies';
+const VERSION = '2026-04-27-ytdlp-post-cookies-multi-format';
 
 // ── helpers ────────────────────────────────────────────────────────────────────
 
@@ -138,6 +139,180 @@ function safeFilename(name) {
   return name.replace(/[^a-zA-Z0-9._-]/g, '_').slice(0, 200) || 'clip';
 }
 
+/**
+ * Encode a clip from separate video/audio URLs into a specific aspect ratio.
+ *
+ * The source video is scaled so its longest dimension fits the target box, then
+ * padded with black bars on the remaining sides.  This preserves all content
+ * without cropping.
+ *
+ * Supported aspectRatio values: '16:9' | '9:16' | '1:1'
+ *
+ * @param {string}      videoUrl   - Direct URL to the video stream
+ * @param {string|null} audioUrl   - Direct URL to the audio stream (or null)
+ * @param {number}      start      - Start offset in seconds
+ * @param {number}      duration   - Clip length in seconds
+ * @param {'16:9'|'9:16'|'1:1'} aspectRatio
+ * @param {string}      title      - Used only for logging
+ * @returns {Promise<Buffer>}      - Encoded MP4 bytes
+ */
+function encodeClipWithAspectRatio(videoUrl, audioUrl, start, duration, aspectRatio, title) {
+  // Target canvas dimensions (width x height).
+  // We use 1280×720 / 720×1280 / 720×720 as the baseline to keep file sizes
+  // reasonable; the scale filter will never upscale beyond the source.
+  const DIMENSIONS = {
+    '16:9': { w: 1280, h: 720  },
+    '9:16': { w: 720,  h: 1280 },
+    '1:1':  { w: 720,  h: 720  },
+  };
+
+  const dim = DIMENSIONS[aspectRatio];
+  if (!dim) {
+    return Promise.reject(new Error(`Unknown aspect ratio: ${aspectRatio}`));
+  }
+
+  const { w, h } = dim;
+
+  // Scale the video to fit inside the target box (never upscale), then pad to
+  // exactly w×h with black.  force_original_aspect_ratio=decrease ensures the
+  // scaled video is always ≤ w and ≤ h before padding.
+  const vf = [
+    `scale=${w}:${h}:force_original_aspect_ratio=decrease:flags=lanczos`,
+    `pad=${w}:${h}:(ow-iw)/2:(oh-ih)/2:black`,
+    // Ensure width and height are divisible by 2 (libx264 requirement).
+    `format=yuv420p`,
+  ].join(',');
+
+  const ffmpegArgs = [
+    '-ss', String(start),
+    '-i', videoUrl,
+    ...(audioUrl ? ['-ss', String(start), '-i', audioUrl, '-map', '0:v:0', '-map', '1:a:0'] : []),
+    '-t', String(duration),
+    '-vf', vf,
+    '-c:v', 'libx264',
+    '-preset', 'veryfast',
+    '-crf', '23',
+    '-c:a', 'aac',
+    '-b:a', '128k',
+    '-movflags', 'frag_keyframe+empty_moov+default_base_moof',
+    '-f', 'mp4',
+    'pipe:1',
+  ];
+
+  return new Promise((resolve, reject) => {
+    const ffmpeg = spawn('ffmpeg', ffmpegArgs);
+    const chunks = [];
+
+    ffmpeg.stdout.on('data', (chunk) => { chunks.push(chunk); });
+    ffmpeg.stderr.on('data', (chunk) => {
+      process.stdout.write(`[ffmpeg:${aspectRatio}:${title}] ${chunk}`);
+    });
+    ffmpeg.on('error', reject);
+    ffmpeg.on('close', (code) => {
+      if (code !== 0) {
+        return reject(new Error(`ffmpeg exited ${code} for aspect ratio ${aspectRatio}`));
+      }
+      resolve(Buffer.concat(chunks));
+    });
+  });
+}
+
+// ── ZIP builder (no external deps) ────────────────────────────────────────────
+//
+// Builds a valid ZIP archive in memory from an array of { name, data } entries.
+// Uses DEFLATE compression via Node's built-in zlib.deflateRawSync.
+//
+// Reference: https://pkware.cachefly.net/webdocs/casestudies/APPNOTE.TXT
+
+/**
+ * @param {{ name: string, data: Buffer }[]} entries
+ * @returns {Buffer}
+ */
+function buildZip(entries) {
+  const localHeaders = [];
+  const centralHeaders = [];
+  let offset = 0;
+
+  for (const { name, data } of entries) {
+    const nameBytes    = Buffer.from(name, 'utf8');
+    const compressed   = deflateRawSync(data, { level: 6 });
+    const crc          = crc32(data);
+    const dosDate      = dosDateTime(new Date());
+
+    // Local file header (signature 0x04034b50)
+    const local = Buffer.alloc(30 + nameBytes.length);
+    local.writeUInt32LE(0x04034b50, 0);  // signature
+    local.writeUInt16LE(20,          4);  // version needed
+    local.writeUInt16LE(0x0800,      6);  // flags: UTF-8 name
+    local.writeUInt16LE(8,           8);  // compression: DEFLATE
+    local.writeUInt16LE(dosDate.time, 10);
+    local.writeUInt16LE(dosDate.date, 12);
+    local.writeUInt32LE(crc >>> 0,   14);
+    local.writeUInt32LE(compressed.length, 18);
+    local.writeUInt32LE(data.length,       22);
+    local.writeUInt16LE(nameBytes.length,  26);
+    local.writeUInt16LE(0,                 28); // extra field length
+    nameBytes.copy(local, 30);
+
+    localHeaders.push(local);
+    localHeaders.push(compressed);
+
+    // Central directory header (signature 0x02014b50)
+    const central = Buffer.alloc(46 + nameBytes.length);
+    central.writeUInt32LE(0x02014b50, 0);  // signature
+    central.writeUInt16LE(20,          4);  // version made by
+    central.writeUInt16LE(20,          6);  // version needed
+    central.writeUInt16LE(0x0800,      8);  // flags: UTF-8 name
+    central.writeUInt16LE(8,           10); // compression: DEFLATE
+    central.writeUInt16LE(dosDate.time, 12);
+    central.writeUInt16LE(dosDate.date, 14);
+    central.writeUInt32LE(crc >>> 0,   16);
+    central.writeUInt32LE(compressed.length, 20);
+    central.writeUInt32LE(data.length,       24);
+    central.writeUInt16LE(nameBytes.length,  28);
+    central.writeUInt16LE(0,                 30); // extra field length
+    central.writeUInt16LE(0,                 32); // file comment length
+    central.writeUInt16LE(0,                 34); // disk number start
+    central.writeUInt16LE(0,                 36); // internal attributes
+    central.writeUInt32LE(0,                 38); // external attributes
+    central.writeUInt32LE(offset,            42); // relative offset of local header
+    nameBytes.copy(central, 46);
+
+    centralHeaders.push(central);
+    offset += local.length + compressed.length;
+  }
+
+  const centralDir   = Buffer.concat(centralHeaders);
+  const eocd         = Buffer.alloc(22);
+  eocd.writeUInt32LE(0x06054b50,          0);  // end-of-central-directory signature
+  eocd.writeUInt16LE(0,                   4);  // disk number
+  eocd.writeUInt16LE(0,                   6);  // disk with central dir
+  eocd.writeUInt16LE(entries.length,      8);  // entries on this disk
+  eocd.writeUInt16LE(entries.length,      10); // total entries
+  eocd.writeUInt32LE(centralDir.length,   12); // central dir size
+  eocd.writeUInt32LE(offset,              16); // central dir offset
+  eocd.writeUInt16LE(0,                   20); // comment length
+
+  return Buffer.concat([...localHeaders, centralDir, eocd]);
+}
+
+/**
+ * Convert a JS Date to the DOS date/time format used in ZIP headers.
+ * @param {Date} d
+ * @returns {{ date: number, time: number }}
+ */
+function dosDateTime(d) {
+  const time =
+    ((d.getHours()   & 0x1f) << 11) |
+    ((d.getMinutes() & 0x3f) << 5)  |
+    ((d.getSeconds() >> 1)   & 0x1f);
+  const date =
+    (((d.getFullYear() - 1980) & 0x7f) << 9) |
+    (((d.getMonth() + 1)       & 0x0f) << 5) |
+    ((d.getDate()              & 0x1f));
+  return { time, date };
+}
+
 // ── request handler ────────────────────────────────────────────────────────────
 
 async function handleRequest(req, res) {
@@ -163,6 +338,8 @@ async function handleRequest(req, res) {
       version: VERSION,
       ytDlpVersion: ytdlpVersionResult.stdout.trim(),
       youtubeCookiesConfigured,
+      multiFormatSupport: true,
+      supportedAspectRatios: ['16:9', '9:16', '1:1'],
     }));
     return;
   }
@@ -280,6 +457,103 @@ async function handleRequest(req, res) {
     req.once('close', () => { ffmpeg.kill('SIGTERM'); });
     req.once('error', () => { ffmpeg.kill('SIGTERM'); });
 
+    return;
+  }
+
+  // ── GET /clips ────────────────────────────────────────────────────────────────
+  // Same params as /clip but generates all three aspect ratios in parallel and
+  // returns a ZIP archive containing clip_16x9.mp4, clip_9x16.mp4, clip_1x1.mp4.
+  if (parsed.pathname === '/clips') {
+    // Token auth (optional but strongly recommended)
+    if (WORKER_TOKEN && req.headers['x-worker-token'] !== WORKER_TOKEN) {
+      res.writeHead(401, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Unauthorized' }));
+      return;
+    }
+
+    const videoId  = parsed.searchParams.get('videoId');
+    const clipUrl  = parsed.searchParams.get('url');
+    const startRaw = parsed.searchParams.get('start');
+    const endRaw   = parsed.searchParams.get('end');
+    const title    = parsed.searchParams.get('title') || 'clip';
+
+    if (!videoId && !clipUrl) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Missing required parameter: videoId or url' }));
+      return;
+    }
+    if (startRaw === null || endRaw === null) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Missing required parameters: start, end' }));
+      return;
+    }
+
+    const start = parseFloat(startRaw);
+    const end   = parseFloat(endRaw);
+
+    if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Invalid parameters: start and end must be numbers and end must be greater than start' }));
+      return;
+    }
+
+    const requested = end - start;
+    const duration  = Math.min(requested, MAX_CLIP_DURATION);
+    const capped    = duration < requested;
+
+    // Resolve the source URL once — all three encodes share the same CDN URLs.
+    let videoUrl, audioUrl;
+    try {
+      ({ videoUrl, audioUrl } = await resolveVideoUrl(videoId, clipUrl));
+    } catch (err) {
+      console.error('[clips] yt-dlp error:', err.message);
+      res.writeHead(502, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Could not resolve video URL', detail: err.message }));
+      return;
+    }
+
+    // Encode all three formats in parallel.
+    const FORMATS = [
+      { ratio: '16:9', filename: 'clip_16x9.mp4' },
+      { ratio: '9:16', filename: 'clip_9x16.mp4' },
+      { ratio: '1:1',  filename: 'clip_1x1.mp4'  },
+    ];
+
+    console.log(`[clips] encoding ${FORMATS.length} formats in parallel for "${title}" (${duration}s)`);
+
+    let results;
+    try {
+      results = await Promise.all(
+        FORMATS.map(({ ratio, filename }) =>
+          encodeClipWithAspectRatio(videoUrl, audioUrl, start, duration, ratio, title)
+            .then((data) => ({ filename, data }))
+        )
+      );
+    } catch (err) {
+      console.error('[clips] ffmpeg error:', err.message);
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'ffmpeg encoding failed', detail: err.message }));
+      return;
+    }
+
+    // Pack all three MP4s into a single ZIP archive.
+    const zipBuffer = buildZip(results);
+    const zipFilename = `${safeFilename(title)}_clips.zip`;
+
+    const headers = {
+      'Content-Type': 'application/zip',
+      'Content-Disposition': `attachment; filename="${zipFilename}"`,
+      'Content-Length': String(zipBuffer.length),
+      'Cache-Control': 'no-store',
+      'X-Clip-Duration': String(duration),
+      'X-Clip-Formats': FORMATS.map((f) => f.ratio).join(','),
+    };
+    if (capped) {
+      headers['X-Clip-Capped'] = `true; max=${MAX_CLIP_DURATION}s`;
+    }
+
+    res.writeHead(200, headers);
+    res.end(zipBuffer);
     return;
   }
 
