@@ -9,7 +9,7 @@ import { deflateRawSync, crc32 } from 'zlib';
 const PORT = process.env.PORT || 3000;
 const WORKER_TOKEN = process.env.WORKER_TOKEN || '';
 const MAX_CLIP_DURATION = 300; // seconds
-const VERSION = '2026-04-28-kick-chrome-ua';
+const VERSION = '2026-04-28-kick-sec-fetch-headers';
 
 // Chrome User-Agent sent with all Kick requests so both Cloudflare and Kick's
 // own API accept the request.  Aligned with Chrome 131, the highest version
@@ -213,6 +213,15 @@ async function resolveVideoUrl(videoId, url) {
     // request due to missing browser navigation context headers.
     args.push('--add-headers', 'Referer:https://kick.com');
     args.push('--add-headers', 'Origin:https://kick.com');
+    // Cloudflare inspects Sec-Fetch-* headers to confirm the request looks like
+    // a legitimate same-origin browser fetch (XHR / fetch API).  Without these
+    // headers Kick's metadata endpoint returns HTTP 403.
+    args.push('--add-headers', 'Sec-Fetch-Dest:empty');
+    args.push('--add-headers', 'Sec-Fetch-Mode:cors');
+    args.push('--add-headers', 'Sec-Fetch-Site:same-origin');
+    // Kick's API returns JSON; include a browser-style Accept header so the
+    // response content-type negotiation succeeds.
+    args.push('--add-headers', 'Accept:application/json, text/plain, */*');
     // Kick's metadata API now requires an "Authorization: Bearer <session_token>"
     // header (HTTP 403 without it).  yt-dlp's Kick extractor builds this header
     // automatically from the "session_token" cookie.  We support two ways to
