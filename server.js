@@ -9,7 +9,7 @@ import { deflateRawSync, crc32 } from 'zlib';
 const PORT = process.env.PORT || 3000;
 const WORKER_TOKEN = process.env.WORKER_TOKEN || '';
 const MAX_CLIP_DURATION = 300; // seconds
-const VERSION = '2026-04-28-kick-chrome-ua';
+const VERSION = '2026-05-03-source-routing';
 
 // Chrome User-Agent sent with all Kick requests so both Cloudflare and Kick's
 // own API accept the request.  Aligned with Chrome 131, the highest version
@@ -280,6 +280,50 @@ function safeFilename(name) {
 }
 
 /**
+ * Construct the canonical source URL from the `source` query parameter and its
+ * accompanying identifier(s).  Returns null when none of the recognised
+ * combinations is present (caller falls back to the legacy `videoId`/`url`
+ * parameters).
+ *
+ * Supported combinations:
+ *   source=youtube  + videoId=XXXX         → https://www.youtube.com/watch?v=XXXX
+ *   source=twitch   + videoId=123456789    → https://www.twitch.tv/videos/123456789  (VOD)
+ *   source=twitch   + clipSlug=SomeSlug    → https://clips.twitch.tv/SomeSlug        (clip)
+ *   source=kick     + url=https://kick.com/… → the url value unchanged
+ *
+ * @param {string|null} source
+ * @param {string|null} videoId
+ * @param {string|null} clipSlug
+ * @param {string|null} url
+ * @returns {{ resolvedUrl: string|null, isTwitchClip: boolean }}
+ */
+function buildSourceUrl(source, videoId, clipSlug, url) {
+  if (!source) return { resolvedUrl: null, isTwitchClip: false };
+
+  switch (source.toLowerCase()) {
+    case 'youtube':
+      if (!videoId) return { resolvedUrl: null, isTwitchClip: false };
+      return { resolvedUrl: `https://www.youtube.com/watch?v=${videoId}`, isTwitchClip: false };
+
+    case 'twitch':
+      if (clipSlug) {
+        return { resolvedUrl: `https://clips.twitch.tv/${clipSlug}`, isTwitchClip: true };
+      }
+      if (videoId) {
+        return { resolvedUrl: `https://www.twitch.tv/videos/${videoId}`, isTwitchClip: false };
+      }
+      return { resolvedUrl: null, isTwitchClip: false };
+
+    case 'kick':
+      if (!url) return { resolvedUrl: null, isTwitchClip: false };
+      return { resolvedUrl: url, isTwitchClip: false };
+
+    default:
+      return { resolvedUrl: null, isTwitchClip: false };
+  }
+}
+
+/**
  * Encode a clip from separate video/audio URLs into a specific aspect ratio.
  *
  * The source video is scaled so its longest dimension fits the target box, then
@@ -503,19 +547,30 @@ async function handleRequest(req, res) {
       return;
     }
 
+    const source   = parsed.searchParams.get('source');   // youtube | twitch | kick
     const videoId  = parsed.searchParams.get('videoId');
+    const clipSlug = parsed.searchParams.get('clipSlug'); // Twitch clip slug
     const clipUrl  = parsed.searchParams.get('url');
     const startRaw = parsed.searchParams.get('start');
     const endRaw   = parsed.searchParams.get('end');
     const title    = parsed.searchParams.get('title') || 'clip';
     const format   = parsed.searchParams.get('format'); // horizontal | vertical | square
 
-    if (!videoId && !clipUrl) {
+    // Resolve the source URL from the `source` parameter (new API) or fall back
+    // to the legacy `videoId` / `url` parameters for backward compatibility.
+    const { resolvedUrl: builtUrl, isTwitchClip } = buildSourceUrl(source, videoId, clipSlug, clipUrl);
+    const effectiveUrl  = builtUrl ?? clipUrl;
+    const effectiveId   = builtUrl ? null : videoId;
+
+    if (!effectiveId && !effectiveUrl) {
       res.writeHead(400, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ error: 'Missing required parameter: videoId or url' }));
+      res.end(JSON.stringify({ error: 'Missing required parameter: videoId, url, or a valid source+identifier combination' }));
       return;
     }
-    if (startRaw === null || endRaw === null) {
+
+    // start/end are required for all sources except Twitch clip slugs (those are
+    // already trimmed segments — we encode the whole clip when no range is given).
+    if (!isTwitchClip && (startRaw === null || endRaw === null)) {
       res.writeHead(400, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ error: 'Missing required parameters: start, end' }));
       return;
@@ -530,8 +585,10 @@ async function handleRequest(req, res) {
     }
     const aspectRatio = format ? FORMAT_TO_RATIO[format] : null;
 
-    const start = parseFloat(startRaw);
-    const end   = parseFloat(endRaw);
+    // For Twitch clips without an explicit range, default to the whole clip
+    // (start=0, duration=MAX_CLIP_DURATION — ffmpeg stops when the source ends).
+    const start = startRaw !== null ? parseFloat(startRaw) : 0;
+    const end   = endRaw   !== null ? parseFloat(endRaw)   : MAX_CLIP_DURATION;
 
     if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start) {
       res.writeHead(400, { 'Content-Type': 'application/json' });
@@ -545,7 +602,7 @@ async function handleRequest(req, res) {
 
     let videoUrl, audioUrl;
     try {
-      ({ videoUrl, audioUrl } = await resolveVideoUrl(videoId, clipUrl));
+      ({ videoUrl, audioUrl } = await resolveVideoUrl(effectiveId, effectiveUrl));
     } catch (err) {
       console.error('[clip] yt-dlp error:', err.message);
       res.writeHead(502, { 'Content-Type': 'application/json' });
@@ -660,25 +717,31 @@ async function handleRequest(req, res) {
       return;
     }
 
+    const source   = parsed.searchParams.get('source');
     const videoId  = parsed.searchParams.get('videoId');
+    const clipSlug = parsed.searchParams.get('clipSlug');
     const clipUrl  = parsed.searchParams.get('url');
     const startRaw = parsed.searchParams.get('start');
     const endRaw   = parsed.searchParams.get('end');
     const title    = parsed.searchParams.get('title') || 'clip';
 
-    if (!videoId && !clipUrl) {
+    const { resolvedUrl: builtUrl, isTwitchClip } = buildSourceUrl(source, videoId, clipSlug, clipUrl);
+    const effectiveUrl = builtUrl ?? clipUrl;
+    const effectiveId  = builtUrl ? null : videoId;
+
+    if (!effectiveId && !effectiveUrl) {
       res.writeHead(400, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ error: 'Missing required parameter: videoId or url' }));
+      res.end(JSON.stringify({ error: 'Missing required parameter: videoId, url, or a valid source+identifier combination' }));
       return;
     }
-    if (startRaw === null || endRaw === null) {
+    if (!isTwitchClip && (startRaw === null || endRaw === null)) {
       res.writeHead(400, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ error: 'Missing required parameters: start, end' }));
       return;
     }
 
-    const start = parseFloat(startRaw);
-    const end   = parseFloat(endRaw);
+    const start = startRaw !== null ? parseFloat(startRaw) : 0;
+    const end   = endRaw   !== null ? parseFloat(endRaw)   : MAX_CLIP_DURATION;
 
     if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start) {
       res.writeHead(400, { 'Content-Type': 'application/json' });
@@ -693,7 +756,7 @@ async function handleRequest(req, res) {
     // Resolve the source URL once — all three encodes share the same CDN URLs.
     let videoUrl, audioUrl;
     try {
-      ({ videoUrl, audioUrl } = await resolveVideoUrl(videoId, clipUrl));
+      ({ videoUrl, audioUrl } = await resolveVideoUrl(effectiveId, effectiveUrl));
     } catch (err) {
       console.error('[clips] yt-dlp error:', err.message);
       res.writeHead(502, { 'Content-Type': 'application/json' });
