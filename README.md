@@ -22,6 +22,10 @@ Tiny HTTP service that takes `{source, videoId/clipSlug/url, start, end}` and st
   - Header: `x-worker-token: <WORKER_TOKEN>` (if set)
   - Returns: `video/mp4` stream as an attachment.
 - `GET /clips` — same parameters as `/clip`; returns a ZIP containing `clip_16x9.mp4`, `clip_9x16.mp4`, and `clip_1x1.mp4`.
+- `GET /audio` — extract an audio segment and stream it back as `audio/mpeg` (MP3).
+  - Header: `x-worker-token: <WORKER_TOKEN>` (if set)
+  - Uses the same `source` routing as `/clip`, but takes `duration` (seconds) instead of `end`.
+  - Returns: `audio/mpeg` stream as an attachment (suitable for base64 encoding by the caller).
 
 ### `/clip` parameter combinations
 
@@ -32,6 +36,18 @@ Tiny HTTP service that takes `{source, videoId/clipSlug/url, start, end}` and st
 | `twitch` (clip) | `clipSlug` | `start`, `end`, `title`, `format` |
 | `kick` | `url`, `start`, `end` | `title`, `format` |
 | *(legacy)* | `videoId` or `url`, `start`, `end` | `title`, `format` |
+
+### `/audio` parameter combinations
+
+| source | required params | optional params |
+|--------|----------------|-----------------|
+| `youtube` | `videoId`, `duration` | `start`, `title` |
+| `twitch` (VOD) | `videoId`, `duration` | `start`, `title` |
+| `twitch` (clip) | `clipSlug` | `start`, `duration`, `title` |
+| `kick` | `url`, `duration` | `start`, `title` |
+| *(legacy)* | `videoId` or `url`, `duration` | `start`, `title` |
+
+`start` defaults to `0`. `duration` is capped at 300 s.
 
 **Examples:**
 ```
@@ -74,6 +90,11 @@ curl -H "x-worker-token: mysecret" \
 curl -H "x-worker-token: mysecret" \
   "http://localhost:3000/clip?source=twitch&clipSlug=AwesomeClipSlug" \
   -o twitch_clip.mp4
+
+# Audio-only extract (30 s of YouTube audio starting at 60 s)
+curl -H "x-worker-token: mysecret" \
+  "http://localhost:3000/audio?source=youtube&videoId=dQw4w9WgXcQ&start=60&duration=30" \
+  -o audio.mp3
 ```
 
 ## Notes

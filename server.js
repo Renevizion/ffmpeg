@@ -9,7 +9,7 @@ import { deflateRawSync, crc32 } from 'zlib';
 const PORT = process.env.PORT || 3000;
 const WORKER_TOKEN = process.env.WORKER_TOKEN || '';
 const MAX_CLIP_DURATION = 300; // seconds
-const VERSION = '2026-05-03-source-routing';
+const VERSION = '2026-05-03-audio-endpoint';
 
 // Chrome User-Agent sent with all Kick requests so both Cloudflare and Kick's
 // own API accept the request.  Aligned with Chrome 131, the highest version
@@ -164,6 +164,28 @@ availableImpersonateTargets().then((targets) => {
 });
 
 /**
+ * Classify a source URL by hostname into platform flags.
+ * Uses the URL constructor for proper hostname extraction so that the platform
+ * name appearing in query-string parameters cannot spoof the result.
+ *
+ * @param {string} sourceUrl
+ * @returns {{ isYouTube: boolean, isKick: boolean, isTwitch: boolean }}
+ */
+function classifySourceUrl(sourceUrl) {
+  let hostname = '';
+  try {
+    hostname = new URL(sourceUrl).hostname.replace(/^www\./i, '').toLowerCase();
+  } catch {
+    // unparseable URL — no platform flags set
+  }
+  return {
+    isYouTube: hostname === 'youtube.com' || hostname === 'youtu.be',
+    isKick:    hostname === 'kick.com',
+    isTwitch:  hostname === 'twitch.tv',
+  };
+}
+
+/**
  * Run yt-dlp to resolve the best video (and audio) URL(s) for a given source.
  * Accepts either a full URL (Kick, Twitch, YouTube, etc.) or a bare YouTube
  * video ID.  When yt-dlp selects a format with separate video and audio streams
@@ -178,9 +200,7 @@ async function resolveVideoUrl(videoId, url) {
   // Prefer an explicit URL; fall back to constructing a YouTube watch URL.
   const sourceUrl = url || `https://www.youtube.com/watch?v=${videoId}`;
 
-  const isYouTube = sourceUrl.includes('youtube.com') || sourceUrl.includes('youtu.be');
-  const isKick    = sourceUrl.includes('kick.com');
-  const isTwitch  = sourceUrl.includes('twitch.tv');
+  const { isYouTube, isKick, isTwitch } = classifySourceUrl(sourceUrl);
 
   const cookiePath = writeCookieFile();
 
@@ -266,6 +286,73 @@ async function resolveVideoUrl(videoId, url) {
         videoUrl: urls[0],
         audioUrl: urls.length > 1 ? urls[1] : null,
       });
+    });
+  });
+}
+
+/**
+ * Run yt-dlp to resolve the best audio-only URL for a given source.
+ * Returns a single direct audio URL (no video stream).
+ *
+ * @param {string|null} videoId - YouTube video ID (legacy)
+ * @param {string|null} url     - Full source URL (Kick/Twitch/YouTube/…)
+ * @returns {Promise<string>}
+ */
+async function resolveAudioUrl(videoId, url) {
+  const sourceUrl = url || `https://www.youtube.com/watch?v=${videoId}`;
+
+  const { isYouTube, isKick, isTwitch } = classifySourceUrl(sourceUrl);
+
+  const cookiePath = writeCookieFile();
+
+  const args = [
+    '--no-playlist',
+    '-f', 'bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio',
+    '--get-url',
+  ];
+
+  if (isYouTube) {
+    args.push('--extractor-args', 'youtube:player_client=web,mweb,tv_embedded,default');
+    args.push('--impersonate', kickImpersonateTarget);
+  }
+
+  if (isKick) {
+    console.log(`[yt-dlp/audio] Kick URL — using --impersonate ${kickImpersonateTarget}`);
+    args.push('--impersonate', kickImpersonateTarget);
+    args.push('--user-agent', KICK_CHROME_USER_AGENT);
+    args.push('--add-headers', 'Referer:https://kick.com');
+    args.push('--add-headers', 'Origin:https://kick.com');
+    const kickSessionCookiePath = writeKickSessionTokenCookieFile();
+    const kickCookiePath = kickSessionCookiePath ? null : writeKickCookieFile();
+    const activeCookiePath = kickSessionCookiePath || kickCookiePath;
+    if (activeCookiePath) {
+      args.push('--cookies', activeCookiePath);
+    }
+  }
+
+  if (!isKick && cookiePath) {
+    args.push('--cookies', cookiePath);
+  }
+
+  args.push(sourceUrl);
+
+  console.log(`[yt-dlp/audio] resolving audio URL: ${sourceUrl}`);
+  if (isTwitch) console.log('[yt-dlp/audio] Twitch URL detected');
+
+  return new Promise((resolve, reject) => {
+    const ytdlp = spawn('yt-dlp', args);
+    let stdout = '';
+    let stderr = '';
+    ytdlp.stdout.on('data', (chunk) => { stdout += chunk; });
+    ytdlp.stderr.on('data', (chunk) => { stderr += chunk; });
+    ytdlp.on('error', reject);
+    ytdlp.on('close', (code) => {
+      if (code !== 0) {
+        return reject(new Error(`yt-dlp exited ${code}: ${stderr.trim()}`));
+      }
+      const audioUrl = stdout.trim().split('\n')[0].trim();
+      if (!audioUrl) return reject(new Error('yt-dlp returned empty audio URL'));
+      resolve(audioUrl);
     });
   });
 }
@@ -806,6 +893,123 @@ async function handleRequest(req, res) {
 
     res.writeHead(200, headers);
     res.end(zipBuffer);
+    return;
+  }
+
+  // ── GET /audio ────────────────────────────────────────────────────────────────
+  // Extracts an audio segment and streams it back as MP3.
+  // Params (same source routing as /clip):
+  //   source=youtube&videoId=XXXX | source=twitch&videoId=... | source=twitch&clipSlug=...
+  //   source=kick&url=... | url=... (legacy) | videoId=... (legacy)
+  //   start    - start offset in seconds (default 0)
+  //   duration - segment length in seconds (required unless source is a Twitch clip)
+  if (parsed.pathname === '/audio') {
+    if (WORKER_TOKEN && req.headers['x-worker-token'] !== WORKER_TOKEN) {
+      res.writeHead(401, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Unauthorized' }));
+      return;
+    }
+
+    const source      = parsed.searchParams.get('source');
+    const videoId     = parsed.searchParams.get('videoId');
+    const clipSlug    = parsed.searchParams.get('clipSlug');
+    const clipUrl     = parsed.searchParams.get('url');
+    const startRaw    = parsed.searchParams.get('start');
+    const durationRaw = parsed.searchParams.get('duration');
+    const title       = parsed.searchParams.get('title') || 'audio';
+
+    const { resolvedUrl: builtUrl, isTwitchClip } = buildSourceUrl(source, videoId, clipSlug, clipUrl);
+    const effectiveUrl = builtUrl ?? clipUrl;
+    const effectiveId  = builtUrl ? null : videoId;
+
+    if (!effectiveId && !effectiveUrl) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Missing required parameter: videoId, url, or a valid source+identifier combination' }));
+      return;
+    }
+
+    if (!isTwitchClip && durationRaw === null) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Missing required parameter: duration' }));
+      return;
+    }
+
+    const start    = startRaw    !== null ? parseFloat(startRaw)    : 0;
+    const duration = durationRaw !== null ? parseFloat(durationRaw) : MAX_CLIP_DURATION;
+
+    if (!Number.isFinite(start) || start < 0) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Invalid parameter: start must be a non-negative number' }));
+      return;
+    }
+    if (!Number.isFinite(duration) || duration <= 0) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Invalid parameter: duration must be a positive number' }));
+      return;
+    }
+
+    const clampedDuration = Math.min(duration, MAX_CLIP_DURATION);
+    const capped = clampedDuration < duration;
+
+    let audioStreamUrl;
+    try {
+      audioStreamUrl = await resolveAudioUrl(effectiveId, effectiveUrl);
+    } catch (err) {
+      console.error('[audio] yt-dlp error:', err.message);
+      res.writeHead(502, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Could not resolve audio URL', detail: err.message }));
+      return;
+    }
+
+    const ffmpegArgs = [
+      '-ss', String(start),
+      '-i', audioStreamUrl,
+      '-t', String(clampedDuration),
+      '-vn',             // drop any video stream
+      '-c:a', 'libmp3lame',
+      '-q:a', '4',       // VBR ~165 kbps — good quality, modest file size
+      '-f', 'mp3',
+      'pipe:1',
+    ];
+
+    const ffmpeg = spawn('ffmpeg', ffmpegArgs);
+
+    const filename = `${safeFilename(title)}.mp3`;
+    const headers = {
+      'Content-Type': 'audio/mpeg',
+      'Content-Disposition': `attachment; filename="${filename}"`,
+      'Cache-Control': 'no-store',
+      'X-Audio-Duration': String(clampedDuration),
+    };
+    if (capped) headers['X-Audio-Capped'] = `true; max=${MAX_CLIP_DURATION}s`;
+    res.writeHead(200, headers);
+
+    ffmpeg.stdout.pipe(res);
+
+    ffmpeg.on('error', (err) => {
+      console.error('[audio] ffmpeg spawn error:', err.message);
+      if (!res.headersSent) {
+        res.writeHead(500, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'ffmpeg unavailable', detail: err.message }));
+      } else if (!res.writableEnded) {
+        res.end();
+      }
+    });
+
+    ffmpeg.stderr.on('data', (chunk) => {
+      process.stdout.write(`[ffmpeg/audio] ${chunk}`);
+    });
+
+    ffmpeg.on('close', (code) => {
+      if (code !== 0) {
+        console.error(`[audio] ffmpeg exited with code ${code}`);
+      }
+      if (!res.writableEnded) res.end();
+    });
+
+    req.once('close', () => { ffmpeg.kill('SIGTERM'); });
+    req.once('error', () => { ffmpeg.kill('SIGTERM'); });
+
     return;
   }
 
